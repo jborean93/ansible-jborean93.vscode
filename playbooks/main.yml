@@ -1,0 +1,13 @@
+- hosts: localhost
+  gather_facts: no
+  tasks:
+  - name: ping module
+    ping:
+    register: ping_result
+
+  - name: run command
+    command: whoamiNone
+    register: cmd_res
+
+  - debug:
+      var: cmd_res

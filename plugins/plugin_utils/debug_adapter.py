@@ -6,39 +6,97 @@ __metaclass__ = type
 
 import json
 
-from ansible.module_utils.common.text.converters import to_bytes, to_text
+from ansible.module_utils.common.text.converters import (
+    to_bytes,
+    to_text
+)
+
+from typing import (
+    Any,
+    Dict,
+    Optional,
+)
 
 
-class DebugEvent:
+class ProtocolMessage:
 
-    def __init__(self, seq, arguments):
-        self.seq = seq
-        self.arguments = arguments
+    def __init__(
+            self,
+            content: Dict[str, Any],
+    ):
+        self.seq: int = int(content['seq'])
+        self.type: str = content['type']
+        self._content: Dict[str, Any] = content
 
 
-class ConfigurationDoneRequest(DebugEvent):
+class Event(ProtocolMessage):
+
+    @property
+    def event(self) -> str:
+        return self._content['event']
+
+    @property
+    def body(self) -> Any:
+        return self._content.get('body')
+
+
+class Request(ProtocolMessage):
+
+    @property
+    def command(self) -> str:
+        return self._content['command']
+
+    @property
+    def arguments(self) -> Any:
+        return self._content.get('arguments')
+
+
+class Response(ProtocolMessage):
+
+    @property
+    def request_seq(self) -> int:
+        return int(self._content['request_seq'])
+
+    @property
+    def success(self) -> bool:
+        return bool(self._content['success'])
+
+    @property
+    def command(self) -> str:
+        return self._content['command']
+
+    @property
+    def message(self) -> Optional[str]:
+        return self._content.get('message')
+
+    @property
+    def body(self) -> Any:
+        return self._content.get('body')
+
+
+class ConfigurationDoneRequest(Request):
     pass
 
 
-class ContinueRequest(DebugEvent):
+class ContinueRequest(Request):
 
     @property
-    def thread_id(self):
+    def thread_id(self) -> int:
         return int(self.arguments['threadId'])
 
 
-class DisconnectRequest(DebugEvent):
+class DisconnectRequest(Request):
 
     @property
-    def restart(self):
-        return self.arguments.get('restart', False)
+    def restart(self) -> bool:
+        return bool(self.arguments.get('restart', False))
 
     @property
-    def terminate_debuggee(self):
-        return self.arguments.get('terminateDebuggee', False)
+    def terminate_debuggee(self) -> bool:
+        return bool(self.arguments.get('terminateDebuggee', False))
 
 
-class InitializeRequest(DebugEvent):
+class InitializeRequest(Request):
 
     @property
     def client_id(self):
@@ -507,13 +565,24 @@ class DebugAdapter:
     def _process_response(self, response):
         a = ''
 
-    def _send_event(self, event, body=None):
+    def _send_event(
+            self,
+            event: str,
+            body: Dict[str, Any] = None,
+    ):
         self._send_content('event', {
             'event': event,
             'body': body,
         })
 
-    def _send_response(self, command, request_seq, body=None, success=True, message=None):
+    def _send_response(
+            self,
+            command: str,
+            request_seq: int,
+            body: Dict[str, Any] = None,
+            success: bool = True,
+            message: Optional[str] = None,
+    ):
         self._send_content('response', {
             'request_seq': request_seq,
             'success': success,
@@ -522,7 +591,11 @@ class DebugAdapter:
             'body': body,
         })
 
-    def _send_content(self, request_type, content):
+    def _send_content(
+            self,
+            request_type: str,
+            content: Dict[str, Any],
+    ):
         content['type'] = request_type
         content['seq'] = self._out_seq_num
         json_content = json.dumps(content, separators=(',', ':'))
