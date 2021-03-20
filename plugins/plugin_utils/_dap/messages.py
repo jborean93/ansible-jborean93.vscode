@@ -342,6 +342,12 @@ class Source:
         self.adapter_data = adapter_data
         self.checksums = checksums or []
 
+    def to_raw(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'path': self.path,
+        }
+
     @classmethod
     def from_raw(
             cls,
@@ -387,6 +393,50 @@ class SourceBreakpoint:
             hit_condition=raw.get('hitCondition'),
             log_message=raw.get('logMessage'),
         )
+
+
+class StackFrame:
+
+    def __init__(
+            self,
+            sid: int,
+            name: str,
+            source: Optional[Source] = None,
+            line: int = 0,
+            column: int = 0,
+            end_line: Optional[int] = None,
+            end_column: Optional[int] = None,
+            can_restart: bool = False,
+            instruction_pointer_reference: Optional[str] = None,
+            module_id: Union[int, str] = None,
+            presentation_hint: str = 'normal',
+    ):
+        self.sid = sid
+        self.name = name
+        self.source = source
+        self.line = line
+        self.column = column
+        self.end_line = end_line
+        self.end_column = end_column
+        self.can_restart = can_restart
+        self.instruction_pointer_reference = instruction_pointer_reference
+        self.module_id = module_id
+        self.presentation_hint = presentation_hint
+
+    def to_raw(self) -> Dict[str, Any]:
+        return {
+            'id': self.sid,
+            'name': self.name,
+            'source': self.source.to_raw() if self.source else None,
+            'line': 0 if not self.source else self.line,
+            'column': 0 if not self.source else self.column,
+            'endLine': self.end_line,
+            'endColumn': self.end_column,
+            'canRestart': self.can_restart,
+            'instructionPointerReference': self.instruction_pointer_reference,
+            'moduleId': self.module_id,
+            'presentationHint': self.presentation_hint,
+        }
 
 
 class Thread:

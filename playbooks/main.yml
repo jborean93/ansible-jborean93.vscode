@@ -1,4 +1,4 @@
-- hosts: localhost
+- hosts: localhost, localhost2
   gather_facts: no
   tasks:
   - name: ping module
@@ -6,8 +6,13 @@
     register: ping_result
 
   - name: run command
-    command: whoamiNone
+    command: whoami
     register: cmd_res
 
   - debug:
       var: cmd_res
+
+#- name: play 2
+#  hosts: localhost
+#  tasks:
+#  - ping:
