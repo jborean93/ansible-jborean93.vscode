@@ -12,7 +12,9 @@
   - debug:
       var: cmd_res
 
-#- name: play 2
-#  hosts: localhost
-#  tasks:
-#  - ping:
+- import_playbook: sub.yml
+
+- name: play 2
+  hosts: localhost
+  tasks:
+  - ping:

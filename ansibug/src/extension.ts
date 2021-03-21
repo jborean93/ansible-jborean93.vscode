@@ -85,16 +85,21 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(vscode.debug.registerDebugAdapterDescriptorFactory('ansibug', {
 		createDebugAdapterDescriptor: (session: vscode.DebugSession) => {
+			// Very good chance this doesn't belong here.
             //var terminal = vscode.window.createTerminal({
             //    name: 'ansible-playbook',
             //    cwd: '/home/jborean/dev/ansible_collections/jborean93/vscode/playbooks',
-			//	env: {'ANSIBLE_COLLECTIONS_PATHS': '/home/jborean/dev'},
+			//	env: {
+			//		'ANSIBLE_COLLECTIONS_PATHS': '/home/jborean/dev',
+			//		'ANSIBUG_PORT': '6845',
+			//		'ANSIBUG_PATH': '/tmp/ansibug.run',
+			//	},
             //});
 			//terminal.sendText('ansible-playbook main.yml -vvv');
 
 			return new vscode.DebugAdapterServer(6845);
 		}
-	}));			return new vscode.DebugAdapterServer(6845);
+	}));
 }
 
 export function deactivate() {}

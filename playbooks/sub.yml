@@ -1,0 +1,4 @@
+- hosts: localhost2
+  gather_facts: no
+  roles:
+  - my_role

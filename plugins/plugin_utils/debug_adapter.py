@@ -4,7 +4,6 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-import atexit
 import select
 import socket
 import threading
@@ -52,8 +51,6 @@ class DebugAdapter(metaclass=Singleton):
 
     def __init__(
             self,
-            host: str,
-            port: int,
             supports_config_done: bool = True,
             supports_variable_type: bool = True,
     ):
@@ -61,8 +58,6 @@ class DebugAdapter(metaclass=Singleton):
             supports_config_done=supports_config_done,
             supports_variable_type=supports_variable_type,
         )
-        self._host: str = host
-        self._port: int = port
         self._server_sock: Optional[SocketServer] = None
         self._client_sock: Optional[SocketClient] = None
 
@@ -86,7 +81,37 @@ class DebugAdapter(metaclass=Singleton):
         self._thread_wsock, self._thread_rsock = socket.socketpair()
         self._step: Dict[int, bool] = {}
 
-        atexit.register(self.close_connection)
+    def close_connection(self):
+        if self._server_sock:
+            self._server_sock.close()
+            self._server_sock = None
+
+        if self._receive_thread.is_alive():
+            self._thread_wsock.send(b'\x00')
+            self._thread_wsock.shutdown(socket.SHUT_RDWR)
+            self._thread_wsock.close()
+
+            self._receive_thread.join()
+            self._thread_rsock.close()
+
+        if self._client_sock:
+            self._client_sock.close()
+
+    def start_connection(
+            self,
+            host: str,
+            port: int,
+    ):
+        if not self._server_sock:
+            self._server_sock = SocketServer(host, port)
+
+        if not self._client_sock:
+            self._client_sock = self._server_sock.accept()
+
+        if not self._receive_thread.is_alive():
+            self._receive_thread.start()
+
+        self._config_done.wait()
 
     def add_thread(
             self,
@@ -236,35 +261,6 @@ class DebugAdapter(metaclass=Singleton):
                 if v.variables_reference == 0:
                     continue
                 self.remove_variables(v.variables_reference)
-
-    def close_connection(self):
-        if self._server_sock:
-            self._server_sock.close()
-            self._server_sock = None
-
-        if self._receive_thread.is_alive():
-            self._thread_wsock.send(b'\x00')
-            self._thread_wsock.shutdown(socket.SHUT_RDWR)
-            self._thread_wsock.close()
-
-            self._receive_thread.join()
-            self._thread_rsock.close()
-
-        if self._client_sock:
-            self._client_sock.close()
-
-    def start_connection(self):
-        if not self._server_sock:
-            self._server_sock = SocketServer(self._host, self._port)
-
-        if not self._client_sock:
-            self._client_sock = self._server_sock.accept()
-
-        if not self._receive_thread.is_alive():
-            self._receive_thread.start()
-
-    def wait_config_done(self):
-        self._config_done.wait()
 
     def wait_for_breakpoint(
             self,

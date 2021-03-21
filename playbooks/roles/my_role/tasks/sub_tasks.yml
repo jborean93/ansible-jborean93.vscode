@@ -1,0 +1,5 @@
+- name: sub task module
+  ping:
+
+- debug:
+    msg: test

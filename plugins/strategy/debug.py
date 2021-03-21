@@ -47,7 +47,7 @@ class StrategyModule(StrategyBase):
 
     def __init__(self, tqm):
         super(StrategyModule, self).__init__(tqm)
-        self._debug = DebugAdapter('127.0.0.1', 6845)
+        self._debug = DebugAdapter()
 
     def _replace_with_noop(self, target):
         if self.noop_task is None:
@@ -237,8 +237,6 @@ class StrategyModule(StrategyBase):
             threads.append(t)
 
         try:
-            self._debug.start_connection()
-            self._debug.wait_config_done()
             return self._run(iterator, play_context)
 
         finally:
@@ -366,8 +364,11 @@ class StrategyModule(StrategyBase):
                         task_path, task_line = task.get_path().split(':')
                         self._debug.wait_for_breakpoint(thread, task_path, int(task_line))
                         self._queue_task(host, task, task_vars, play_context)
-                        #self._debug.remove_scope(stack.stack_id, 'hostvars')
-                        self._debug.remove_stack(stack.stack_id)
+
+                        # TODO: Handle removing the include_tasks scope when it is exited.
+                        if task.action not in ['include_tasks']:
+                            self._debug.remove_stack(stack.stack_id)
+
                         del task_vars
 
                     # if we're bypassing the host loop, break out now
