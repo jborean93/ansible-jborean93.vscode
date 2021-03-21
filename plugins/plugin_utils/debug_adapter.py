@@ -4,607 +4,413 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-import json
+import atexit
+import select
+import socket
+import threading
 
-from ansible.module_utils.common.text.converters import (
-    to_bytes,
-    to_text
+from ansible.utils.singleton import (
+    Singleton,
 )
 
 from typing import (
     Any,
     Dict,
+    List,
     Optional,
 )
 
+from ._dap.connection import (
+    DebugAdapterConnection,
+)
 
-class ProtocolMessage:
+from ._dap.messages import (
+    Breakpoint,
+    ConfigurationDoneRequest,
+    ContinueRequest,
+    LaunchRequest,
+    NextRequest,
+    Scope,
+    ScopesRequest,
+    SetBreakpointsRequest,
+    Source,
+    StackFrame,
+    StackTraceRequest,
+    Thread,
+    ThreadsRequest,
+    Variable,
+    VariablesRequest,
+)
+
+from .socket import (
+    SocketClient,
+    SocketServer,
+)
+
+
+class DebugAdapter(metaclass=Singleton):
 
     def __init__(
             self,
-            content: Dict[str, Any],
+            host: str,
+            port: int,
+            supports_config_done: bool = True,
+            supports_variable_type: bool = True,
     ):
-        self.seq: int = int(content['seq'])
-        self.type: str = content['type']
-        self._content: Dict[str, Any] = content
-
-
-class Event(ProtocolMessage):
-
-    @property
-    def event(self) -> str:
-        return self._content['event']
-
-    @property
-    def body(self) -> Any:
-        return self._content.get('body')
-
-
-class Request(ProtocolMessage):
-
-    @property
-    def command(self) -> str:
-        return self._content['command']
-
-    @property
-    def arguments(self) -> Any:
-        return self._content.get('arguments')
-
-
-class Response(ProtocolMessage):
-
-    @property
-    def request_seq(self) -> int:
-        return int(self._content['request_seq'])
-
-    @property
-    def success(self) -> bool:
-        return bool(self._content['success'])
-
-    @property
-    def command(self) -> str:
-        return self._content['command']
-
-    @property
-    def message(self) -> Optional[str]:
-        return self._content.get('message')
-
-    @property
-    def body(self) -> Any:
-        return self._content.get('body')
-
-
-class ConfigurationDoneRequest(Request):
-    pass
-
-
-class ContinueRequest(Request):
-
-    @property
-    def thread_id(self) -> int:
-        return int(self.arguments['threadId'])
-
-
-class DisconnectRequest(Request):
-
-    @property
-    def restart(self) -> bool:
-        return bool(self.arguments.get('restart', False))
-
-    @property
-    def terminate_debuggee(self) -> bool:
-        return bool(self.arguments.get('terminateDebuggee', False))
-
-
-class InitializeRequest(Request):
-
-    @property
-    def client_id(self):
-        return self.arguments.get('clientID', None)
-
-    @property
-    def client_name(self):
-        return self.arguments.get('clientName', None)
-
-    @property
-    def adapter_id(self):
-        return self.arguments.get('adapterID', None)
-
-    @property
-    def locale(self):
-        return self.arguments.get('locale', None)
-
-    @property
-    def lines_start_at_1(self):
-        return self.arguments.get('linesStartAt1', True)
-
-    @property
-    def columns_start_at_1(self):
-        return self.arguments.get('columnsStartAt1', True)
-
-    @property
-    def path_format(self):
-        return self.arguments.get('pathFormat', 'path')
-
-    @property
-    def supports_variable_type(self):
-        return self.arguments.get('supportsVariableType', False)
-
-    @property
-    def supports_variable_paging(self):
-        return self.arguments.get('supportsVariablePaging', False)
-
-    @property
-    def supports_run_in_terminal_request(self):
-        return self.arguments.get('supportsRunInTerminalRequest', False)
-
-    @property
-    def supports_memory_references(self):
-        return self.arguments.get('supportsMemoryReferences', False)
-
-    @property
-    def supports_progress_reporting(self):
-        return self.arguments.get('supportsProgressReporting', False)
-
-    @property
-    def supports_invalidated_event(self):
-        return self.arguments.get('supportsInvalidatedEvent', False)
-
-
-class LaunchRequest(DebugEvent):
-
-    @property
-    def no_debug(self):
-        return self.arguments.get('noDebug', False)
-
-
-class NextRequest(DebugEvent):
-
-    @property
-    def thread_id(self):
-        return int(self.arguments['threadId'])
-
-    @property
-    def granularity(self):
-        return self.arguments.get('granularity', None)
-
-
-class ScopesRequest(DebugEvent):
-
-    @property
-    def frame_id(self):
-        return int(self.arguments['frameId'])
-
-
-class SetBreakpointsRequest(DebugEvent):
-
-    @property
-    def source(self):
-        raw = self.arguments.get('source', None)
-
-        return Source(
-            raw.get('name'),
-            path=raw.get('path'),
-            source_reference=int(raw['sourceReference']) if 'sourceReference' in raw else None,
-            presentation_hint=raw.get('presentationHint'),
-            origin=raw.get('origin'),
-            sources=raw.get('sources'),
-            adapter_data=raw.get('adapterData'),
-            checksums=raw.get('checksums'),
+        self._adapter: DebugAdapterConnection = DebugAdapterConnection(
+            supports_config_done=supports_config_done,
+            supports_variable_type=supports_variable_type,
         )
+        self._host: str = host
+        self._port: int = port
+        self._server_sock: Optional[SocketServer] = None
+        self._client_sock: Optional[SocketClient] = None
 
-    @property
-    def breakpoints(self):
-        return [
-            SourceBreakpoint(
-                int(b['line']),
-                column=int(b['column']) if 'column' in b else None,
-                condition=b.get('condition'),
-                hit_condition=b.get('hitCondition'),
-                log_message=b.get('logMessage'),
+        self._counters = {
+            'breakpoint': 1,
+            'thread': 1,
+            'stack': 1,
+            'variable': 1,
+        }
+        self._counter_lock = threading.Lock()
+
+        self._breakpoints: Dict[str, List[Breakpoint]] = {}
+        self._threads: Dict[int, Thread] = {}
+        self._thread_waits: Dict[int, threading.Event] = {}
+        self._stacks: Dict[int, int] = {}
+        self._variables: Dict[int, List[Variable]] = {}
+        self._var_references: Dict[int, int] = {}
+        self._config_done: threading.Event = threading.Event()
+
+        self._receive_thread = threading.Thread(target=self._listen)
+        self._thread_wsock, self._thread_rsock = socket.socketpair()
+        self._step: Dict[int, bool] = {}
+
+        atexit.register(self.close_connection)
+
+    def add_thread(
+            self,
+            name: str,
+    ) -> Thread:
+        thread = Thread(self._counter('thread'), name)
+        self._threads[thread.thread_id] = thread
+
+        return thread
+
+    def remove_thread(
+            self,
+            thread_id: int,
+    ):
+        thread = self._threads[thread_id]
+        for stack in thread.stacks:
+            self.remove_stack(stack.stack_id)
+
+        del self._threads[thread_id]
+
+    def add_stack(
+            self,
+            thread: Thread,
+            name: str,
+            source: Optional[Source] = None,
+            line: int = 0,
+            column: int = 0,
+            presentation_hint: str = 'normal',
+    ) -> StackFrame:
+        stack = StackFrame(
+            stack_id=self._counter('stack'),
+            name=name,
+            source=source,
+            line=line,
+            column=column,
+            presentation_hint=presentation_hint,
+        )
+        thread.stacks.append(stack)
+        self._stacks[stack.stack_id] = thread.thread_id
+
+        return stack
+
+    def remove_stack(
+            self,
+            stack_id: int,
+    ):
+        thread_id = self._stacks[stack_id]
+        thread = self._threads[thread_id]
+
+        stack_idx, stack = next(iter(
+            (idx, stack)
+            for idx, stack in enumerate(thread.stacks)
+            if stack.stack_id == stack_id
+        ))
+
+        for scope in stack.scopes:
+            self.remove_scope(stack.stack_id, scope.name)
+
+        del self._threads[thread_id].stacks[stack_idx]
+        del self._stacks[stack_id]
+
+    def add_scope(
+            self,
+            stack: StackFrame,
+            name: str,
+            presentation_hint: str = 'normal',
+            variables: Dict[str, Any] = None,
+    ) -> Scope:
+        var_reference = 0
+        if variables:
+            var_reference = self.add_variables(variables)
+
+        scope = Scope(
+            name=name,
+            variables_reference=var_reference,
+            presentation_hint=presentation_hint,
+        )
+        stack.scopes.append(scope)
+
+        return scope
+
+    def remove_scope(
+            self,
+            stack_id: int,
+            name: str,
+    ):
+        thread_id = self._stacks[stack_id]
+        stack = next(iter(
+            stack
+            for stack in self._threads[thread_id].stacks
+            if stack.stack_id == stack_id
+        ))
+        scope_idx, scope = next(iter(
+            (idx, scope)
+            for idx, scope in enumerate(stack.scopes)
+            if scope.name == name
+        ))
+        del stack.scopes[scope_idx]
+        self.remove_variables(scope.variables_reference)
+
+    def add_variables(
+            self,
+            variables: Dict[str, Any],
+    ) -> int:
+        ref_id = self._counter('variable')
+
+        var_list = []
+        for key, value in variables.items():
+            variables_reference = 0
+            named_variables = 0
+            indexed_variables = 0
+
+            if isinstance(value, list):
+                indexed_variables = len(value)
+                variables_reference = self.add_variables({
+                    str(idx): entry
+                    for idx, entry in enumerate(value)
+                })
+
+            elif isinstance(value, dict):
+                named_variables = len(value)
+                variables_reference = self.add_variables(value)
+
+            var_list.append(Variable(
+                name=str(key),
+                value=repr(value),
+                value_type=type(value).__name__,
+                variables_reference=variables_reference,
+                named_variables=named_variables,
+                indexed_variables=indexed_variables,
+            ))
+
+        self._variables[ref_id] = var_list
+        self._var_references.setdefault(ref_id, 0)
+        self._var_references[ref_id] += 1
+
+        return ref_id
+
+    def remove_variables(
+            self,
+            variables_reference: int,
+    ):
+        self._var_references[variables_reference] -= 1
+        if self._var_references[variables_reference] < 1:
+            scan_vars = self._variables.pop(variables_reference)
+            for v in scan_vars:
+                if v.variables_reference == 0:
+                    continue
+                self.remove_variables(v.variables_reference)
+
+    def close_connection(self):
+        if self._server_sock:
+            self._server_sock.close()
+            self._server_sock = None
+
+        if self._receive_thread.is_alive():
+            self._thread_wsock.send(b'\x00')
+            self._thread_wsock.shutdown(socket.SHUT_RDWR)
+            self._thread_wsock.close()
+
+            self._receive_thread.join()
+            self._thread_rsock.close()
+
+        if self._client_sock:
+            self._client_sock.close()
+
+    def start_connection(self):
+        if not self._server_sock:
+            self._server_sock = SocketServer(self._host, self._port)
+
+        if not self._client_sock:
+            self._client_sock = self._server_sock.accept()
+
+        if not self._receive_thread.is_alive():
+            self._receive_thread.start()
+
+    def wait_config_done(self):
+        self._config_done.wait()
+
+    def wait_for_breakpoint(
+            self,
+            thread: Thread,
+            path: str,
+            line: int,
+    ):
+        bp_list = self._breakpoints.get(path, [])
+        for bp in bp_list:
+            if bp.line == line:
+                self._adapter.stop(
+                    'breakpoint',
+                    thread_id=thread.thread_id,
+                    hit_breakpoint_ids=[bp.breakpoint_id],
+                    all_threads_stopped=False,
+                )
+                self._client_sock.send(self._adapter.data_to_send())
+
+                wait = self._thread_waits.setdefault(thread.thread_id,
+                                                     threading.Event())
+                wait.wait()
+                return
+
+        if self._step.setdefault(thread.thread_id, False):
+            self._adapter.stop(
+                'step',
+                thread_id=thread.thread_id,
+                all_threads_stopped=False,
             )
-            for b in self.arguments.get('breakpoints', [])
-        ]
+            self._client_sock.send(self._adapter.data_to_send())
 
-    @property
-    def source_modified(self):
-        return self.arguments.get('sourceModified', False)
+            wait = self._thread_waits.setdefault(thread.thread_id,
+                                                 threading.Event())
+            wait.wait()
 
+    def _counter(
+            self,
+            name: str,
+    ) -> int:
+        with self._counter_lock:
+            num = self._counters[name]
+            self._counters[name] += 1
+            return num
 
-class StackTraceRequest(DebugEvent):
-
-    def thread_id(self):
-        return int(self.arguments['threadId'])
-
-    def start_frame(self):
-        return int(self.arguments.get('startFrame', 0))
-
-    def levels(self):
-        return int(self.arguments.get('levels', 0))
-
-    def format(self):
-        return self.arguments.get('format', None)
-
-
-class ThreadRequest(DebugEvent):
-    pass
-
-
-class VariablesRequest(DebugEvent):
-
-    @property
-    def variable_reference(self):
-        return int(self.arguments['variablesReference'])
-
-    @property
-    def filter(self):
-        return self.arguments.get('filter')
-
-    @property
-    def start(self):
-        return int(self.arguments.get('start', 0))
-
-    @property
-    def count(self):
-        return int(self.arguments.get('count', 0))
-
-    @property
-    def format(self):
-        return self.arguments.get('format', None)
-
-
-class Breakpoint:
-
-    def __init__(self, bid, verified, message=None, source=None, line=None, column=None, end_line=None,
-                 end_column=None, instruction_reference=None, offset=None):
-        self.bid = bid
-        self.verified = verified
-        self.message = message
-        self.source = source
-        self.line = line
-        self.column = column
-        self.end_line = end_line
-        self.end_column = end_column
-        self.instruction_reference = instruction_reference
-        self.offset = offset
-
-    def to_value(self):
-        return {
-            'id': int(self.bid),
-            'verified': self.verified,
-            'message': self.message,
-        }
-
-
-class Source:
-
-    def __init__(self, name, path=None, source_reference=None, presentation_hint=None, origin=None, sources=None,
-                 adapter_data=None, checksums=None):
-        self.name = name
-        self.path = path
-        self.source_reference = source_reference
-        self.presentation_hint = presentation_hint
-        self.origin = origin
-        self.sources = sources or []
-        self.adapter_data = adapter_data
-        self.checksums = checksums or []
-
-    def to_value(self):
-        return {
-            'name': self.name,
-            'path': self.path,
-        }
-
-
-class SourceBreakpoint:
-
-    def __init__(self, line, column=None, condition=None, hit_condition=None, log_message=None):
-        self.line = line
-        self.column = column
-        self.condition = condition
-        self.hit_condition = hit_condition
-        self.log_message = log_message
-
-
-class DebugAdapter:
-
-    def __init__(self):
-        self._in_buffer = None
-        self._out_buffer = []
-        self.__seq_num = 1
-        self.__out_seq_num = 1
-
-        self.client_id = None
-        self.client_name = None
-        self.adapter_id = None
-        self.locale = None
-        self.lines_start_at_1 = False
-        self.columns_start_at_1 = False
-        self.path_format = None
-        self.supports_variable_type = False
-        self.supports_variable_paging = False
-        self.supports_run_in_terminal_request = False
-        self.supports_memory_references = False
-        self.supports_progress_reporting = False
-        self.supports_invalidated_event = False
-
-    @property
-    def _seq_num(self):
-        num = self.__seq_num
-        self.__seq_num += 1
-        return num
-
-    @property
-    def _out_seq_num(self):
-        num = self.__out_seq_num
-        self.__out_seq_num += 1
-        return num
-
-    def send_threads(self, req_seq, threads):
-        self._send_response('threads', req_seq, {'threads': [{"id": 1, "name": "main"}]})
-
-    def set_breakpoints(self, req_seq, breakpoints):
-        b = [v.to_value() for v in breakpoints]
-        self._send_response('setBreakpoints', req_seq, {'breakpoints': b})
-
-    def stop(self, reason, description=None, thread_id=None, preserve_focus_hint=False, text=None,
-             all_threads_stopped=False, hit_breakpoint_ids=None):
-        breakpoint_ids = []
-        if isinstance(hit_breakpoint_ids, int):
-            breakpoint_ids.append(hit_breakpoint_ids)
-        elif isinstance(hit_breakpoint_ids, list):
-            breakpoint_ids.extend(breakpoint_ids)
-
-        return self._send_event('stopped', {
-            'reason': reason,
-            'description': description,
-            'threadId': int(thread_id) if thread_id is not None else None,
-            'preserveFocusHint': preserve_focus_hint,
-            'text': text,
-            'allThreadsStopped': all_threads_stopped,
-            'hitBreakpointsIds': breakpoint_ids,
-        })
-
-    def data_to_send(self):
-        if not self._out_buffer:
-            return
-
-        return self._out_buffer.pop(0)
-
-    def receive_data(self, data):
-        events = []
-
+    def _listen(self):
         while True:
-            if not self._in_buffer:
-                self._in_buffer = {
-                    'buffer': bytearray(),
-                    'headers': {},
-                    'header_read': False,
-                }
+            read = select.select([self._client_sock.sock,
+                                 self._thread_rsock], [], [])[0]
 
-            next_msg = self._in_buffer
-            next_msg['buffer'] += data
+            if self._client_sock.sock in read:
+                self._process_dap_msg()
 
-            if not next_msg['header_read']:
-                split = next_msg['buffer'].find(b'\r\n\r\n')
-                if split == -1:
-                    break  # Need more data
+            if self._thread_rsock in read:
+                self._thread_rsock.recv(1024)
+                break
 
-                raw_headers = bytes(next_msg['buffer'][:split])
-                next_msg['buffer'] = next_msg['buffer'][split + 4:]
-                next_msg['header_read'] = True
+        self._adapter.terminate()
+        self._client_sock.send(self._adapter.data_to_send())
+        disconnect = self._adapter.receive_data(self._client_sock.recv())[0]
+        self._adapter.send_response(disconnect.command, disconnect.seq)
+        self._client_sock.send(self._adapter.data_to_send())
 
-                headers = dict([to_text(v).split(': ') for v in raw_headers.split(b'\r\n')])
-                headers['Content-Length'] = int(headers['Content-Length'])
-                next_msg['headers'] = headers
+    def _process_dap_msg(self):
+        in_data = self._client_sock.recv()
+        messages = self._adapter.receive_data(in_data)
 
-            content_length = next_msg['headers']['Content-Length']
-            if len(next_msg['buffer']) < content_length:
-                break  # Need more data
+        for msg in messages:
+            if isinstance(msg, ConfigurationDoneRequest):
+                self._config_done.set()
+                self._adapter.send_response(msg.command, msg.seq)
 
-            b_content = bytes(next_msg['buffer'][:content_length])
-            print(to_text(b_content))
-            content = json.loads(to_text(b_content, errors='surrogate_or_strict'))
+            elif isinstance(msg, ContinueRequest):
+                self._step[msg.thread_id] = False
 
-            expected_seq_num = self._seq_num
-            if content['seq'] != expected_seq_num:
-                raise Exception("Sequence numbers %d does not match expected %d" % (content['seq'], expected_seq_num))
+                bp_event = self._thread_waits[msg.thread_id]
+                bp_event.set()
+                bp_event.clear()
 
-            if content['type'] == 'event':
-                events.append(self._process_event(content))
+                self._adapter.send_response(msg.command, msg.seq, body={
+                    'allThreadsContinued': False,
+                })
 
-            elif content['type'] == 'request':
-                events.append(self._process_request(content))
+            elif isinstance(msg, LaunchRequest):
+                # Meant to launch Ansible, we have already done that.
+                self._adapter.send_response(msg.command, msg.seq)
 
-            elif content['type'] == 'response':
-                events.append(self._process_response(content))
+            elif isinstance(msg, NextRequest):
+                self._step[msg.thread_id] = True
 
-            self._in_buffer = None
-            data = next_msg['buffer'][content_length:]
+                bp_event = self._thread_waits[msg.thread_id]
+                bp_event.set()
+                bp_event.clear()
 
-        return events
+                self._adapter.send_response(msg.command, msg.seq)
 
-    def _process_event(self, event):
-        a = ''
+            elif isinstance(msg, ScopesRequest):
+                thread_id = self._stacks[msg.frame_id]
+                thread = self._threads[thread_id]
+                stack = next(iter(
+                    s
+                    for s in thread.stacks
+                    if s.stack_id == msg.frame_id
+                ))
 
-    def _process_request(self, request):
-        command = request['command']
-        arguments = request.get('arguments', {})
-        seq = request['seq']
+                self._adapter.send_response(msg.command, msg.seq, body={
+                    'scopes': [s.to_raw() for s in stack.scopes],
+                })
 
-        if command == 'configurationDone':
-            event = ConfigurationDoneRequest(seq, arguments)
-            self._send_response(command, seq)
-
-        elif command == 'continue':
-            event = ContinueRequest(seq, arguments)
-            self._send_response(command, seq, {
-                'allThreadsContinued': True,
-            })
-
-        elif command == 'disconnect':
-            event = DisconnectRequest(seq, arguments)
-            self._send_response(command, seq)
-
-        elif command == 'initialize':
-            # https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Initialize
-            event = InitializeRequest(seq, arguments)
-            self.client_id = event.client_id
-            self.client_name = event.client_name
-            self.adapter_id = event.adapter_id
-            self.locale = event.locale
-            self.lines_start_at_1 = event.lines_start_at_1
-            self.columns_start_at_1 = event.columns_start_at_1
-            self.path_format = event.path_format
-            self.supports_variable_type = event.supports_variable_type
-            self.supports_variable_paging = event.supports_variable_paging
-            self.supports_run_in_terminal_request = event.supports_run_in_terminal_request
-            self.supports_memory_references = event.supports_memory_references
-            self.supports_progress_reporting = event.supports_progress_reporting
-            self.supports_invalidated_event = event.supports_invalidated_event
-
-            capabilities = {
-                # https://microsoft.github.io/debug-adapter-protocol/specification#Types_Capabilities
-                'supportsConfigurationDoneRequest': True,
-                'supportsVariableType': True,
-            }
-            self._send_response(command, seq, capabilities)
-            self._send_event('initialized')
-
-        elif command == 'launch':
-            event = LaunchRequest(seq, arguments)
-            self._send_response(command, seq)
-
-        elif command == 'next':
-            event = NextRequest(seq, arguments)
-            self._send_response(command, seq)
-
-        elif command == 'scopes':
-            event = ScopesRequest(seq, arguments)
-            self._send_response(command, seq, {
-                'scopes': [
-                    {
-                        'name': 'my scope',
-                        'presentationHint': 'arguments',
-                        'variablesReference': 1,
-                        'namedVariables': 10,
-                        'indexedVariables': 20,
-                        'expensive': False,
-                    },
-                    {
-                        'name': 'my scope locals',
-                        'presentationHint': 'locals',
-                        'variablesReference': 1,
-                        'namedVariables': 10,
-                        'indexedVariables': 20,
-                        'expensive': False,
-                    },
-                    {
-                        'name': 'my scope registers',
-                        'presentationHint': 'registers',
-                        'variablesReference': 1,
-                        'namedVariables': 10,
-                        'indexedVariables': 20,
-                        'expensive': False,
-                    }
+            elif isinstance(msg, SetBreakpointsRequest):
+                # TODO: Validate it exists and verify/updatepath
+                breakpoints = [
+                    Breakpoint(
+                        breakpoint_id=self._counter('breakpoint'),
+                        verified=True,
+                        source=msg.source,
+                        line=b.line,
+                        column=b.column,
+                    )
+                    for idx, b in enumerate(msg.breakpoints, start=1)
                 ]
-            })
+                self._breakpoints[msg.source.path] = breakpoints
 
-        elif command == 'setBreakpoints':
-            event = SetBreakpointsRequest(seq, arguments)
+                self._adapter.send_response(msg.command, msg.seq, body={
+                    'breakpoints': [b.to_raw() for b in breakpoints],
+                })
 
-        elif command == 'stackTrace':
-            event = StackTraceRequest(seq, arguments)
-            self._send_response(command, seq, {
-                'stackFrames': [
-                    {
-                        'id': 1,
-                        'name': 'stack frame name',
-                        'source': Source(
-                            'main.yml',
-                            path='/home/jborean/dev/vscode-mock-debug/sampleWorkspace/main.yml'
-                        ).to_value(),
-                        'line': 4,
-                        'column': 0,
-                    },
-                    {
-                        'id': 2,
-                        'name': 'other frame',
-                        'source': Source(
-                            'main.yml',
-                            path='/home/jborean/dev/vscode-mock-debug/sampleWorkspace/main.yml',
-                        ).to_value(),
-                        'line': 1,
-                        'column': 0,
-                    }
-                ],
-                'totalFrames': 2,
-            })
+            elif isinstance(msg, StackTraceRequest):
+                stacks = list(reversed(self._threads[msg.thread_id].stacks))
 
-        elif command == 'threads':
-            event = ThreadRequest(seq, arguments)
+                self._adapter.send_response(msg.command, msg.seq, body={
+                    'stackFrames': [s.to_raw() for s in stacks],
+                    'totalFrames': len(stacks),
+                })
 
-        elif command == 'variables':
-            event = VariablesRequest(seq, arguments)
-            self._send_response(command, seq, {
-                'variables': [
-                    {
-                        'name': 'variable',
-                        'value': 'var value',
-                        'variablesReference': 1,
-                        'type': 'str',
-                    }
-                ]
-            })
+            elif isinstance(msg, ThreadsRequest):
+                self._adapter.send_response(msg.command, msg.seq, body={
+                    'threads': [t.to_raw() for t in self._threads.values()],
+                })
 
-        else:
-            event = command
+            elif isinstance(msg, VariablesRequest):
+                variables = self._variables[msg.variables_reference]
 
-        return event
+                self._adapter.send_response(msg.command, msg.seq, body={
+                    'variables': [v.to_raw() for v in variables],
+                })
 
-    def _process_response(self, response):
-        a = ''
-
-    def _send_event(
-            self,
-            event: str,
-            body: Dict[str, Any] = None,
-    ):
-        self._send_content('event', {
-            'event': event,
-            'body': body,
-        })
-
-    def _send_response(
-            self,
-            command: str,
-            request_seq: int,
-            body: Dict[str, Any] = None,
-            success: bool = True,
-            message: Optional[str] = None,
-    ):
-        self._send_content('response', {
-            'request_seq': request_seq,
-            'success': success,
-            'command': command,
-            'message': message,
-            'body': body,
-        })
-
-    def _send_content(
-            self,
-            request_type: str,
-            content: Dict[str, Any],
-    ):
-        content['type'] = request_type
-        content['seq'] = self._out_seq_num
-        json_content = json.dumps(content, separators=(',', ':'))
-        b_content = to_bytes(json_content, errors='surrogate_or_strict')
-        print(json_content)
-
-        response = b'\r\n'.join([
-            b'Content-Length: %s' % to_bytes(len(b_content)),
-            b'',
-            b_content,
-        ])
-        self._out_buffer.append(response)
+        out_data = self._adapter.data_to_send()
+        if out_data:
+            self._client_sock.send(out_data)

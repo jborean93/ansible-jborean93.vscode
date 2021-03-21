@@ -14,9 +14,6 @@ author: Jordan Borean (@jborean93)
 '''
 
 import os.path
-import select
-import socket
-import threading
 
 from ansible import constants as C
 from ansible.errors import AnsibleError, AnsibleAssertionError
@@ -32,36 +29,12 @@ from ansible.plugins.strategy import StrategyBase
 from ansible.template import Templar
 from ansible.utils.display import Display
 
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Tuple,
-)
-
-from ..plugin_utils._dap.connection import (
-    DebugAdapterConnection,
+from ..plugin_utils.debug_adapter import (
+    DebugAdapter,
 )
 
 from ..plugin_utils._dap.messages import (
-    Breakpoint,
-    ConfigurationDoneRequest,
-    ContinueRequest,
-    LaunchRequest,
-    ScopesRequest,
-    SetBreakpointsRequest,
     Source,
-    StackFrame,
-    StackTraceRequest,
-    Thread,
-    ThreadsRequest,
-    VariablesRequest,
-)
-
-from ..plugin_utils.socket import (
-    SocketClient,
-    SocketServer,
 )
 
 
@@ -74,33 +47,7 @@ class StrategyModule(StrategyBase):
 
     def __init__(self, tqm):
         super(StrategyModule, self).__init__(tqm)
-        self._debug = DebugAdapterConnection()
-        self._config_done = threading.Event()
-
-        self._threads: Dict[int, Dict[str, Any]] = {}
-        self.__thread_counter = 1
-        self.__stack_counter = 1
-
-        self._breakpoints: Dict[int, Breakpoint] = {}
-        self.__breakpoint_counter = 1
-
-    @property
-    def _thread_counter(self):
-        num = self.__thread_counter
-        self.__thread_counter += 1
-        return num
-
-    @property
-    def _breakpoint_counter(self):
-        num = self.__breakpoint_counter
-        self.__breakpoint_counter += 1
-        return num
-
-    @property
-    def _stack_counter(self):
-        num = self.__stack_counter
-        self.__stack_counter += 1
-        return num
+        self._debug = DebugAdapter('127.0.0.1', 6845)
 
     def _replace_with_noop(self, target):
         if self.noop_task is None:
@@ -249,181 +196,7 @@ class StrategyModule(StrategyBase):
         display.debug("all hosts are done, so returning None's for all hosts")
         return [(host, None) for host in hosts]
 
-    def _process_dap(
-            self,
-            sock: SocketClient,
-    ) -> bool:
-        close = False
-
-        in_data = sock.recv()
-        messages = self._debug.receive_data(in_data)
-
-        for msg in messages:
-            if isinstance(msg, ConfigurationDoneRequest):
-                # Initial debug config has been sent, start the play.
-                self._config_done.set()
-
-            elif isinstance(msg, ContinueRequest):
-                thread = self._threads[msg.thread_id]
-                if not thread['wait'].is_set():
-                    thread['wait'].set()
-                    thread['wait'].clear()
-
-                self._debug.send_response(msg.command, msg.seq, body={
-                    'allThreadsContinued': False,
-                })
-
-            elif isinstance(msg, LaunchRequest):
-                # Meant to launch Ansible, we have already done that.
-                self._debug.send_response(msg.command, msg.seq)
-
-            elif isinstance(msg, ScopesRequest):
-                thread = None
-                for thread_info in self._threads.values():
-                    for frame in thread_info['stacks']:
-                        if frame.sid == msg.frame_id:
-                            thread = thread_info['thread']
-                            break
-
-                self._debug.send_response(msg.command, msg.seq, body={
-                    'scopes': [
-                        {
-                            'name': 'host_vars',
-                            'variablesReference': thread.tid,
-                            'presentationHint': 'arguments',
-                            'expensive': False,
-                        }
-                    ]
-                })
-
-            elif isinstance(msg, SetBreakpointsRequest):
-                # TODO: Validate it exists and verify/updatepath
-                breakpoints = [
-                    Breakpoint(
-                        bid=self._breakpoint_counter,
-                        verified=True,
-                        source=msg.source,
-                        line=b.line,
-                        column=b.column,
-                    )
-                    for idx, b in enumerate(msg.breakpoints, start=1)
-                ]
-
-                def fire_bp(
-                        thread: Thread,
-                        breakp: Breakpoint,
-                ):
-                    self._debug.stop('breakpoint',
-                                     hit_breakpoint_ids=[breakp.bid],
-                                     thread_id=thread.tid)
-                    sock.send(self._debug.data_to_send())
-
-                to_add = []
-                to_remove = []
-                for b in breakpoints:
-                    add = True
-                    for existing_b in self._breakpoints.values():
-                        if (
-                            existing_b.line == b.line and
-                            existing_b.column == b.column and
-                            existing_b.source.path == b.source.path
-                        ):
-                            b.bid = existing_b.bid
-                            add = False
-                            break
-
-                    if add:
-                        to_add.append(b)
-
-                for existing_b in self._breakpoints.values():
-                    remove = True
-                    for b in breakpoints:
-                        if (
-                            existing_b.line == b.line and
-                            existing_b.column == b.column and
-                            existing_b.source.path == b.source.path
-                        ):
-                            remove = False
-                            break
-
-                    if remove:
-                        to_remove.append(existing_b)
-
-                for b in to_add:
-                    self._breakpoints[b.bid] = b
-                    setattr(b, 'fire', fire_bp)
-
-                for b in to_remove:
-                    del self._breakpoints[b.bid]
-
-                self._debug.set_breakpoints(msg, breakpoints)
-
-            elif isinstance(msg, StackTraceRequest):
-                stacks = self._threads[msg.thread_id]['stacks']
-                self._debug.send_response(msg.command, msg.seq, body={
-                    'stackFrames': [s.to_raw() for s in stacks],
-                    'totalFrames': len(stacks),
-                })
-
-            elif isinstance(msg, ThreadsRequest):
-                self._debug.send_threads(msg, [
-                    t['thread'] for t in self._threads.values()
-                ])
-
-            elif isinstance(msg, VariablesRequest):
-                thread_info = self._threads[msg.variable_reference]
-                raw_vars = []
-                for var_name, var_value in thread_info['variables'].items():
-                    raw_vars.append({
-                        'name': var_name,
-                        'value': repr(var_value),
-                        'type': type(var_value).__name__,
-                        'variablesReference': 0,
-                    })
-
-                self._debug.send_response(msg.command, msg.seq, body={
-                    'variables': raw_vars,
-                })
-
-        out_data = self._debug.data_to_send()
-        if out_data:
-            sock.send(out_data)
-
-        return not close
-
-    def _debug_server(
-            self,
-            sock: SocketServer,
-            signal_sock: socket,
-    ):
-        try:
-            client = sock.accept()
-        except OSError:
-            # If the socket was closed before anyone accepted then it raises OSError invalid argument.
-            return
-
-        with client:
-            while True:
-                # We need to be notified from the main thread that the run has ended so wait on either a response on
-                # the client or signal socket from the main thread.
-                read = select.select([client.sock, signal_sock], [], [])[0]
-
-                if client.sock in read:
-                    if not self._process_dap(client):
-                        break
-
-                if signal_sock in read:
-                    # Have been signaled by the parent to stop listening.
-                    signal_sock.recv(1024)  # Just clear out the buffer
-                    break
-
-            self._debug.terminate()
-            client.send(self._debug.data_to_send())
-            disconn = self._debug.receive_data(client.recv())[0]
-            self._debug.send_response(disconn.command, disconn.seq)
-            client.send(self._debug.data_to_send())
-
-    def _field_to_stack_frame(self, field, pres_hint='normal'):
+    def _add_field_as_stack_frame(self, thread, field, pres_hint='normal'):
         field_ds = field.get_ds()
         source = None
         line = column = 0
@@ -444,9 +217,9 @@ class StrategyModule(StrategyBase):
         else:
             field_type = ''
 
-        return StackFrame(
-            sid=self._stack_counter,
-            name=f'{field_type}{field.get_name()}',
+        return self._debug.add_stack(
+            thread,
+            f'{field_type}{field.get_name()}',
             source=source,
             line=line,
             column=column,
@@ -457,50 +230,20 @@ class StrategyModule(StrategyBase):
         play = iterator._play
 
         self._set_hosts_cache(iterator._play)
-
+        threads = []
         for host in self.get_hosts_left(iterator):
-            thread_id = self._thread_counter
-            self._threads[thread_id] = {
-                'thread': Thread(
-                    tid=thread_id,
-                    name=f'{host.name} <{host.address}>',
-                ),
-                'stacks': [
-                    self._field_to_stack_frame(play, 'label'),
-                    StackFrame(
-                        sid=self._stack_counter,
-                        name='playbook',
-                        presentation_hint='label',
-                    ),
-                ],
-                'breakpoint': None,
-                'wait': threading.Event(),
-                'variables': None,
-            }
+            t = self._debug.add_thread(f'{host.name} <{host.address}>')
+            self._add_field_as_stack_frame(t, play)
+            threads.append(t)
 
-        with SocketServer('127.0.0.1', 6845) as s:
-            wsock, rsock = socket.socketpair()
-            client_task = threading.Thread(name='debug-client',
-                                           target=self._debug_server,
-                                           args=(s, rsock))
+        try:
+            self._debug.start_connection()
+            self._debug.wait_config_done()
+            return self._run(iterator, play_context)
 
-            try:
-                client_task.start()
-
-                print("Waiting for client connection")
-                self._config_done.wait()
-                print("Debug config has been sent")
-
-                return self._run(iterator, play_context)
-
-            finally:
-                s.close()
-
-                # Signal the debug task listener to stop so we can join the thread and continue on.
-                wsock.send(b'\x00')
-                wsock.close()
-                client_task.join()
-                rsock.close()
+        finally:
+            for t in threads:
+                self._debug.remove_thread(t.thread_id)
 
     def _run(self, iterator, play_context):
         result = self._tqm.RUN_OK
@@ -608,33 +351,24 @@ class StrategyModule(StrategyBase):
 
                         self._blocked_hosts[host.get_name()] = True
 
-                        thread_name = f'{host.name} <{host.address}>'
                         thread = next(iter(
-                            t for t in self._threads.values()
-                            if t['thread'].name == thread_name
+                            t
+                            for t in self._debug._threads.values()
+                            if t.name == f'{host.name} <{host.address}>'
                         ))
-                        stacks = thread['stacks']
-                        stacks.insert(0, self._field_to_stack_frame(task))
+                        stack = self._add_field_as_stack_frame(thread, task)
+                        self._debug.add_scope(
+                            stack,
+                            'hostvars',
+                            variables=task_vars,
+                        )
 
-                        task_path = task.get_path()
-                        for bp in self._breakpoints.values():
-                            if task_path == bp.source.path + ':' + str(bp.line or 0):
-                                break
-                        else:
-                            bp = None
-
-                        if bp:
-                            thread['breakpoint'] = bp
-                            thread['variables'] = task_vars
-                            bp.fire(thread['thread'], bp)
-                            thread['wait'].wait()
-                            thread['breakpoint'] = None
-                            thread['variables'] = None
-
+                        task_path, task_line = task.get_path().split(':')
+                        self._debug.wait_for_breakpoint(thread, task_path, int(task_line))
                         self._queue_task(host, task, task_vars, play_context)
+                        #self._debug.remove_scope(stack.stack_id, 'hostvars')
+                        self._debug.remove_stack(stack.stack_id)
                         del task_vars
-
-                        stacks.pop(0)
 
                     # if we're bypassing the host loop, break out now
                     if run_once:

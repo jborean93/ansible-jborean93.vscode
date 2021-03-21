@@ -266,7 +266,7 @@ class VariablesRequest(Request):
     _REQUEST = 'variables'
 
     @property
-    def variable_reference(self) -> int:
+    def variables_reference(self) -> int:
         return int(self.arguments['variablesReference'])
 
     @property
@@ -290,7 +290,7 @@ class Breakpoint:
 
     def __init__(
             self,
-            bid: Optional[int] = None,
+            breakpoint_id: Optional[int] = None,
             verified: bool = True,
             message: Optional[str] = None,
             source: Optional['Source'] = None,
@@ -301,7 +301,7 @@ class Breakpoint:
             instruction_reference: Optional[str] = None,
             offset: Optional[int] = None,
     ):
-        self.bid = bid
+        self.breakpoint_id = breakpoint_id
         self.verified = verified
         self.message = message
         self.source = source
@@ -314,9 +314,57 @@ class Breakpoint:
 
     def to_raw(self) -> Dict[str, Any]:
         return {
-            'id': int(self.bid) if self.bid is not None else None,
+            'id': (
+                int(self.breakpoint_id)
+                if self.breakpoint_id is not None
+                else None
+            ),
             'verified': self.verified,
             'message': self.message,
+        }
+
+
+class Scope:
+
+    def __init__(
+            self,
+            name: str,
+            presentation_hint: str,
+            variables_reference: int,
+            named_variables: Optional[int] = None,
+            indexed_variables: Optional[int] = None,
+            expensive: bool = False,
+            source: Optional['Source'] = None,
+            line: Optional[int] = None,
+            column: Optional[int] = None,
+            end_line: Optional[int] = None,
+            end_column: Optional[int] = None,
+    ):
+        self.name = name
+        self.presentation_hint = presentation_hint
+        self.variables_reference = variables_reference
+        self.named_variables = named_variables
+        self.indexed_variables = indexed_variables
+        self.expensive = expensive
+        self.source = source
+        self.line = line
+        self.column = column
+        self.end_line = end_line
+        self.end_column = end_column
+
+    def to_raw(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'presentationHint': self.presentation_hint,
+            'variablesReference': self.variables_reference,
+            'namedVariables': self.named_variables,
+            'indexedVariables': self.indexed_variables,
+            'expensive': self.expensive,
+            'source': self.source,
+            'line': self.line,
+            'column': self.column,
+            'endLine': self.end_line,
+            'endColumn': self.end_column,
         }
 
 
@@ -399,7 +447,7 @@ class StackFrame:
 
     def __init__(
             self,
-            sid: int,
+            stack_id: int,
             name: str,
             source: Optional[Source] = None,
             line: int = 0,
@@ -411,7 +459,7 @@ class StackFrame:
             module_id: Union[int, str] = None,
             presentation_hint: str = 'normal',
     ):
-        self.sid = sid
+        self.stack_id = stack_id
         self.name = name
         self.source = source
         self.line = line
@@ -423,9 +471,11 @@ class StackFrame:
         self.module_id = module_id
         self.presentation_hint = presentation_hint
 
+        self.scopes: List[Scope] = []
+
     def to_raw(self) -> Dict[str, Any]:
         return {
-            'id': self.sid,
+            'id': self.stack_id,
             'name': self.name,
             'source': self.source.to_raw() if self.source else None,
             'line': 0 if not self.source else self.line,
@@ -443,14 +493,77 @@ class Thread:
 
     def __init__(
             self,
-            tid: int,
+            thread_id: int,
             name: str,
     ):
-        self.tid = tid
+        self.thread_id = thread_id
         self.name = name
+        self.stacks: List[StackFrame] = []
 
     def to_raw(self) -> Dict[str, Any]:
         return {
-            'id': self.tid,
+            'id': self.thread_id,
             'name': self.name,
+        }
+
+
+class Variable:
+
+    def __init__(
+            self,
+            name: str,
+            value: str,
+            variables_reference: int,
+            value_type: Optional[str] = None,
+            presentation_hint: Optional['VariablePresentationHint'] = None,
+            evaluate_name: Optional[str] = None,
+            named_variables: Optional[int] = None,
+            indexed_variables: Optional[int] = None,
+            memory_reference: Optional[str] = None,
+    ):
+        self.name = name
+        self.value = value
+        self.variables_reference = variables_reference
+        self.value_type = value_type
+        self.presentation_hint = presentation_hint
+        self.evaluate_name = evaluate_name
+        self.named_variables = named_variables
+        self.indexed_variables = indexed_variables
+        self.memory_reference = memory_reference
+
+    def to_raw(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'value': self.value,
+            'type': self.value_type,
+            'presentationHint': (
+                self.presentation_hint.to_raw()
+                if self.presentation_hint
+                else None
+            ),
+            'evaluateName': self.evaluate_name,
+            'variablesReference': self.variables_reference,
+            'namedVariables': self.named_variables,
+            'indexedVariables': self.indexed_variables,
+            'memoryReference': self.memory_reference,
+        }
+
+
+class VariablePresentationHint:
+
+    def __init__(
+            self,
+            kind: str,
+            attributes: List[str] = None,
+            visibility: Optional[str] = None,
+    ):
+        self.kind = kind
+        self.attributes = attributes or []
+        self.visibility = visibility
+
+    def to_raw(self) -> Dict[str, Any]:
+        return {
+            'kind': self.kind,
+            'attributes': self.attributes,
+            'visibility': self.visibility,
         }

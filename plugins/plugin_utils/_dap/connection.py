@@ -133,7 +133,7 @@ class DebugAdapterConnection:
                 break  # Need more data
 
             b_content = bytes(next_msg['buffer'][:content_length])
-            print(to_text(b_content))
+            # print(to_text(b_content))
             content = json.loads(to_text(b_content, errors='surrogate_or_strict'))
 
             msg = ProtocolMessage(content)
@@ -209,7 +209,7 @@ class DebugAdapterConnection:
         content['seq'] = self._seq_num
         json_content = json.dumps(content, separators=(',', ':'))
         b_content = to_bytes(json_content, errors='surrogate_or_strict')
-        print(json_content)
+        # print(json_content)
 
         response = b'\r\n'.join([
             b'Content-Length: %s' % to_bytes(len(b_content)),
